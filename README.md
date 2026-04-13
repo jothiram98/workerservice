@@ -1,265 +1,205 @@
 # Phase 1.5 Document Pipeline (FastAPI + Docling Async)
 
 ## Overview
-This repository is the Phase 1.5 baseline for a production-minded document processing pipeline:
+This repo contains a Phase 1.5 document processing pipeline:
 
-- FastAPI acts as the orchestration layer.
-- Docling Serve acts as the async conversion engine.
-- Output is Markdown (`.md`) with extracted image files (no base64 in final markdown).
-- Pipeline is queue-less at app level (uses Docling built-in async task system).
+- FastAPI is the orchestrator (job tracking + post-processing).
+- Docling Serve is the conversion engine (async tasks).
+- Output is Markdown (`final.md`) with optional extracted images (no base64 in the final markdown if image extraction is enabled).
 
-This phase is focused on correctness, reliability, and clean contracts before external queues/workers are introduced.
+Phase 1.5 focuses on correctness, reliability, and clean contracts before adding external queues/workers and cloud storage.
 
 ---
 
 ## Current Context
-- Docling OpenAPI source: [openapi.json](C:\Users\niveb\Documents\Personal_Jothiram\Dockling Microservice\openapi.json)
-- Local API understanding: [dockerengine.md](C:\Users\niveb\Documents\Personal_Jothiram\Dockling Microservice\dockerengine.md)
-- Verified local Docling endpoint: `http://localhost:5001`
-- Verified async conversion example output: [sample_converted_async.md](C:\Users\niveb\Documents\Personal_Jothiram\Dockling Microservice\sample_converted_async.md)
-
-Important contract note observed in this environment:
-- Result payload shape is `result["document"]["md_content"]` (singular `document`), not `documents[0]`.
-
----
-
-## Phase 1.5 Goals
-- Keep architecture simple and shippable.
-- Use Docling async API end-to-end.
-- Produce clean markdown without embedded base64 image data.
-- Preserve image placement by replacing data URLs with local/served image paths in-place.
-- Add reliability safeguards: retries, timeout, status model, structured errors, and artifact persistence.
+- Docling Serve endpoint: `http://localhost:5001`
+- FastAPI orchestrator endpoint (local): `http://127.0.0.1:7001`
+- Docling result contract (observed here): `result["document"]["md_content"]`
 
 ---
 
 ## High-Level Architecture
 ```text
 Client
-  -> FastAPI (/process-document)
-  -> Docling (/v1/convert/file/async)
-  -> Poll Docling (/v1/status/poll/{task_id}?wait=2)
-  -> Fetch result (/v1/result/{task_id})
-  -> Post-process markdown (extract base64 images, rewrite links)
-  -> Persist artifacts (.md + images + metadata)
-  -> Return job status/result
+  -> FastAPI: POST /process-document (multipart upload)
+  -> Docling: POST /v1/convert/file/async
+  -> FastAPI polls: GET /v1/status/poll/{task_id}?wait=2
+  -> FastAPI fetches: GET /v1/result/{task_id}
+  -> FastAPI post-processes markdown (optional image extraction + link rewrite)
+  -> FastAPI persists artifacts under outputs/<job_id>/
+  -> Client polls: GET /jobs/{job_id}, fetches result/markdown
 ```
 
 ---
 
-## Recommended API Design (FastAPI)
+## FastAPI API (Phase 1.5)
 
 ### 1) Submit document
 `POST /process-document`
 
-Input:
-- multipart file upload (`file`)
-- optional `tenant_id`
-- optional conversion flags (safe defaults)
+Form fields:
+- `file` (required)
+- `tenant_id` (optional)
+- `to_formats` (default `md`)
+- `convert_include_images` (default `true`)
+- `convert_do_ocr` (default `false`)
+- `max_wait_seconds` (optional override for large docs; seconds)
 
-Output (`202 Accepted`):
+Response (`202 Accepted`):
 ```json
 {
   "job_id": "uuid",
   "status": "submitted",
-  "docling_task_id": "uuid",
+  "docling_task_id": null,
   "created_at": "timestamp"
 }
 ```
 
-### 2) Check job status
+### 2) Job status
 `GET /jobs/{job_id}`
 
-Output:
-```json
-{
-  "job_id": "uuid",
-  "status": "submitted|running|completed|failed|timed_out",
-  "docling_task_id": "uuid",
-  "message": "optional",
-  "durations": {
-    "submit_ms": 0,
-    "poll_ms": 0,
-    "total_ms": 0
-  }
-}
-```
+Status values:
+- `submitted`, `running`, `completed`, `failed`, `timed_out`
 
-### 3) Get final result
+### 3) Job result metadata
 `GET /jobs/{job_id}/result`
 
-Output:
-- JSON containing metadata and file paths
-- or direct markdown response (optional mode)
+Returns paths for:
+- `outputs/<job_id>/final.md`
+- `outputs/<job_id>/raw_docling_result.json`
+- `outputs/<job_id>/metadata.json`
+- extracted image paths (if any)
+
+### 4) Download markdown
+`GET /jobs/{job_id}/markdown`
+
+Returns:
+- `text/markdown` file response
+
+### 5) Resume polling for timed-out jobs
+If a job hits `timed_out`, Docling may still be processing. Resume without resubmitting the file:
+
+`POST /jobs/{job_id}/resume`
+
+Form fields:
+- `max_wait_seconds` (optional; extra polling window in seconds)
 
 ---
 
-## Docling Interaction Contract
+## Artifact Persistence
+Artifacts are written to disk:
 
-### Submit async conversion
-`POST {DOCLING_BASE_URL}/v1/convert/file/async`
+```text
+outputs/<job_id>/
+  input/<original_filename>
+  final.md
+  raw_docling_result.json
+  metadata.json
+  images/ (only if extracted)
+```
 
-Recommended options for this phase:
-- `to_formats=md`
-- `convert_include_images=true`
-- `convert_do_ocr=false` (enable only where needed)
-
-### Poll status
-`GET {DOCLING_BASE_URL}/v1/status/poll/{task_id}?wait=2`
-
-Use bounded retry + timeout:
-- `POLL_INTERVAL_SECONDS=1..2`
-- `MAX_WAIT_SECONDS=300` (adjust by file size profile)
-
-### Fetch result
-`GET {DOCLING_BASE_URL}/v1/result/{task_id}`
-
-Expect:
-- markdown at `document.md_content`
-- status should be success before result fetch
+Important: Phase 1.5 job state is stored in-memory while FastAPI is running (for quick queries), and also written to `outputs/<job_id>/metadata.json`.
+After a FastAPI restart, old job IDs are not queryable via API unless you implement a disk/DB-backed index (recommended for Phase 2).
 
 ---
 
-## Markdown + Image Post-Processing
+## Docling Serve Notes (Important Defaults)
+Docling Serve can clear results after completion depending on its configuration:
 
-### Problem
-Docling can return markdown image tags with base64 `data:image/...` URLs.
+- `DOCLING_SERVE_SINGLE_USE_RESULTS=true` (default)
+- `DOCLING_SERVE_RESULT_REMOVAL_DELAY=300` (default, seconds)
 
-### Phase 1.5 behavior
-1. Parse markdown image links.
-2. Detect links that start with `data:image/`.
-3. Decode and save image bytes to deterministic paths.
-4. Replace original image URLs in markdown with saved file paths.
-5. Persist rewritten markdown as final output.
+This means `/v1/result/{task_id}` may stop working after some time; the orchestrator should fetch results promptly.
 
-### Deterministic naming
-Recommended:
-- `outputs/{job_id}/images/img_0001.png`
-- `outputs/{job_id}/final.md`
-- `outputs/{job_id}/raw_docling_result.json`
-- `outputs/{job_id}/metadata.json`
-
-### Placement guarantee
-Since replacement happens in-place at each original markdown image tag, image ordering and position remain aligned with original document flow.
+Management endpoints (`/v1/memory/*`) return `403` unless enabled:
+- `DOCLING_SERVE_ENABLE_MANAGEMENT_ENDPOINTS=true`
 
 ---
 
-## Reliability Controls (Phase 1.5)
-- Use `httpx.AsyncClient` (avoid blocking `requests` in `async def`).
-- Retry transient HTTP failures with exponential backoff.
-- Mark explicit terminal job states (`completed`, `failed`, `timed_out`).
-- Store raw Docling payload before transformations.
-- Capture and persist timing metrics.
-- Handle edge cases:
-  - `Task not found`
-  - partial/malformed result payload
-  - image decode failure
-  - markdown exists but image extraction fails
-
----
-
-## Configuration
-
-Use environment variables:
+## Configuration (FastAPI)
+Use a `.env` file (see `.env.example`) or environment variables:
 
 ```env
 DOCLING_BASE_URL=http://localhost:5001
 DOCLING_API_KEY=
 DOCLING_TENANT_ID=
+
 POLL_WAIT_SECONDS=2
+POLL_INTERVAL_SECONDS=1
 MAX_WAIT_SECONDS=300
+
 RETRY_MAX_ATTEMPTS=3
 RETRY_BASE_DELAY_MS=500
+REQUEST_TIMEOUT_SECONDS=60
+
 OUTPUT_ROOT=./outputs
+SERVE_ARTIFACTS=true
+MAX_FILE_SIZE_BYTES=52428800
 LOG_LEVEL=INFO
 ```
 
-Notes:
-- If your Docling instance enforces API key, send `X-Api-Key`.
-- If multi-tenant behavior is needed, send `X-Tenant-Id`.
-
 ---
 
-## Suggested Project Layout
+## Project Layout
 ```text
 .
-├── app/
-│   ├── main.py
-│   ├── api/routes.py
-│   ├── services/docling_client.py
-│   ├── services/job_service.py
-│   ├── services/markdown_image_processor.py
-│   ├── models/job_models.py
-│   └── core/config.py
-├── outputs/
-├── openapi.json
-├── dockerengine.md
-└── README.md
+|-- app/
+|   |-- main.py
+|   |-- api/routes.py
+|   |-- core/config.py
+|   |-- models/job_models.py
+|   `-- services/
+|       |-- docling_client.py
+|       |-- job_service.py
+|       |-- job_store.py
+|       `-- markdown_image_processor.py
+|-- outputs/
+|-- openapi.json
+|-- dockerengine.md
+|-- requirements.txt
+|-- .env.example
+`-- README.md
 ```
 
 ---
 
-## Local Run (when implementation files are added)
+## Local Run
+Install dependencies:
 ```bash
-uvicorn app.main:app --reload --port 7001
+python -m pip install -r requirements.txt
 ```
 
-Example call:
+Run:
 ```bash
-curl -X POST "http://localhost:7001/process-document" ^
-  -F "file=@sample.pdf"
+python -m uvicorn app.main:app --reload --host 127.0.0.1 --port 7001
 ```
 
-Then:
+Example submit (increase polling window to 20 minutes):
 ```bash
-curl "http://localhost:7001/jobs/<job_id>"
-curl "http://localhost:7001/jobs/<job_id>/result"
+curl -X POST "http://127.0.0.1:7001/process-document" ^
+  -F "file=@sample.pdf" ^
+  -F "max_wait_seconds=1200"
 ```
 
----
+Poll:
+```bash
+curl "http://127.0.0.1:7001/jobs/<job_id>"
+```
 
-## Acceptance Criteria (Phase 1.5)
-- Async conversion works for `sample.pdf`.
-- Job state transitions are consistent and queryable.
-- Final markdown file is generated.
-- All base64 markdown images are extracted to files and rewritten as file paths.
-- Raw payload + metadata + timings are persisted per job.
-- Failure modes return actionable error messages.
+Download markdown:
+```bash
+curl "http://127.0.0.1:7001/jobs/<job_id>/markdown" -o final.md
+```
 
----
-
-## Operational Notes
-- CPU-only Docling is slower for large PDFs; prefer async flow always.
-- Use bounded page ranges and OCR only when needed for performance.
-- Poll with `wait` query to reduce unnecessary request churn.
-
----
-
-## Security Notes
-- Do not log API keys or raw secrets.
-- Validate upload MIME type and file size limits.
-- Sanitize output file names and paths.
-- Consider malware scanning before processing in later phases.
+Resume (if timed out):
+```bash
+curl -X POST "http://127.0.0.1:7001/jobs/<job_id>/resume" ^
+  -F "max_wait_seconds=1200"
+```
 
 ---
 
 ## Roadmap
-
-### Phase 2
-- Blob/object storage for artifacts.
-- Vision enrichment for extracted images.
-- Better document chunking and indexing hooks.
-
-### Phase 3
-- External queue + worker pool (RabbitMQ/Service Bus/Kafka).
-- Horizontal scaling and backpressure controls.
-- Full observability dashboards and SLOs.
-
----
-
-## Summary
-This Phase 1.5 design keeps your architecture simple but robust:
-- Async-first with Docling.
-- Reliable orchestration via FastAPI.
-- Clean markdown outputs with extracted image assets.
-- Production-minded safeguards without over-engineering.
+- Phase 2: disk-backed index or SQLite/Cosmos DB for job persistence; move artifacts to blob storage.
+- Phase 3: external queue + worker pool if throughput/concurrency requires it.
 

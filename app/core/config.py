@@ -15,7 +15,7 @@ class Settings(BaseSettings):
 
     poll_wait_seconds: float = 2.0
     poll_interval_seconds: float = 1.0
-    max_wait_seconds: float = 300.0
+    max_wait_seconds: float = 1200.0
 
     retry_max_attempts: int = 3
     retry_base_delay_ms: int = 500
