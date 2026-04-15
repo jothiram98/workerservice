@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.models.job_models import ConversionOptions
 
 
 class DoclingClient:
@@ -48,13 +49,17 @@ class DoclingClient:
         filename: str,
         tenant_id: str | None = None,
         to_formats: str = "md",
-        convert_include_images: bool = True,
-        convert_do_ocr: bool = False,
+        conversion_options: ConversionOptions | None = None,
+        picture_description_api: dict[str, Any] | None = None,
     ) -> tuple[str, int]:
         headers = self._headers(tenant_id=tenant_id)
         path = Path(file_path)
         if not path.exists():
             raise FileNotFoundError(f"Input file not found: {file_path}")
+
+        # Use defaults if no conversion_options provided
+        if conversion_options is None:
+            conversion_options = ConversionOptions()
 
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             started = perf_counter()
@@ -62,11 +67,39 @@ class DoclingClient:
             async def do_request():
                 with path.open("rb") as fh:
                     files = {"files": (filename, fh, "application/octet-stream")}
+                    
+                    # Build data payload from conversion_options
                     data = {
                         "to_formats": to_formats,
-                        "convert_include_images": str(convert_include_images).lower(),
-                        "convert_do_ocr": str(convert_do_ocr).lower(),
+                        "table_mode": conversion_options.table_mode,
+                        "do_ocr": str(conversion_options.do_ocr).lower(),
+                        "ocr_engine": conversion_options.ocr_engine,
+                        "image_export_mode": conversion_options.image_export_mode,
+                        "images_scale": str(conversion_options.images_scale),
+                        "include_images": str(conversion_options.include_images).lower(),
+                        "do_picture_description": str(conversion_options.do_picture_description).lower(),
+                        "pdf_backend": conversion_options.pdf_backend,
+                        "abort_on_error": str(conversion_options.abort_on_error).lower(),
                     }
+                    
+                    # Add page_range if both start and end are provided
+                    if conversion_options.page_range_start is not None and conversion_options.page_range_end is not None:
+                        data["page_range"] = f"({conversion_options.page_range_start}, {conversion_options.page_range_end})"
+                    
+                    # Add document_timeout if provided
+                    if conversion_options.document_timeout is not None:
+                        data["document_timeout"] = str(conversion_options.document_timeout)
+                    
+                    # Add picture_description_api if provided
+                    if picture_description_api is not None:
+                        # Picture description API config needs special handling
+                        import json
+                        data["picture_description_api"] = json.dumps(picture_description_api)
+                    
+                    # Add picture_description_prompt if provided and not already included
+                    if conversion_options.picture_description_prompt is not None:
+                        data["picture_description_prompt"] = conversion_options.picture_description_prompt
+                    
                     response = await client.post(
                         f"{self.base_url}/v1/convert/file/async",
                         headers=headers,

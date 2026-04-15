@@ -7,7 +7,7 @@ from time import perf_counter
 from typing import Any
 
 from app.core.config import settings
-from app.models.job_models import JobRecord, JobStatus
+from app.models.job_models import ConversionOptions, JobRecord, JobStatus
 from app.services.docling_client import DoclingClient
 from app.services.job_store import JobStore
 from app.services.markdown_image_processor import extract_and_rewrite_markdown_images
@@ -38,29 +38,76 @@ class JobService:
         await self.store.create(record)
         return record
 
+    def _build_azure_openai_config(self, prompt: str | None = None) -> dict[str, Any]:
+        """Build Azure OpenAI picture description config."""
+        if not settings.azure_openai_api_key:
+            raise ValueError("AZURE_OPENAI_API_KEY not configured")
+        if not settings.azure_openai_resource:
+            raise ValueError("AZURE_OPENAI_RESOURCE not configured")
+        if not settings.azure_openai_deployment:
+            raise ValueError("AZURE_OPENAI_DEPLOYMENT not configured")
+
+        return {
+            "url": f"https://{settings.azure_openai_resource}.openai.azure.com/deployments/{settings.azure_openai_deployment}/chat/completions?api-version={settings.azure_openai_api_version}",
+            "headers": {
+                "api-key": settings.azure_openai_api_key,
+                "Content-Type": "application/json",
+            },
+            "params": {
+                "model": settings.azure_openai_deployment,
+            },
+            "prompt": prompt or "Describe this image in detail.",
+            "timeout": 30,
+            "concurrency": 3,
+        }
+
     async def run_job(
         self,
         job_id: str,
         tenant_id: str | None = None,
         to_formats: str = "md",
-        convert_include_images: bool = True,
-        convert_do_ocr: bool = False,
+        conversion_options: ConversionOptions | None = None,
     ) -> None:
         record = await self.store.get(job_id)
         if record is None:
             return
 
+        # Use defaults if no conversion_options provided
+        if conversion_options is None:
+            conversion_options = ConversionOptions()
+
         started = perf_counter()
-        await self.store.update(job_id, status=JobStatus.running, message="Submitting to Docling async API")
+        await self.store.update(
+            job_id,
+            status=JobStatus.running,
+            message="Submitting to Docling async API",
+            conversion_options=conversion_options,
+        )
 
         try:
+            # Build picture description config if enabled
+            picture_description_api = None
+            if conversion_options.do_picture_description:
+                try:
+                    picture_description_api = self._build_azure_openai_config(
+                        prompt=conversion_options.picture_description_prompt
+                    )
+                except ValueError as e:
+                    await self.store.update(
+                        job_id,
+                        status=JobStatus.failed,
+                        error=f"Azure OpenAI configuration error: {str(e)}",
+                        message="Failed to configure picture description",
+                    )
+                    return
+
             task_id, submit_ms = await self.docling_client.submit_file_async(
                 file_path=record.input_path or "",
                 filename=record.filename or "input.bin",
                 tenant_id=tenant_id,
                 to_formats=to_formats,
-                convert_include_images=convert_include_images,
-                convert_do_ocr=convert_do_ocr,
+                conversion_options=conversion_options,
+                picture_description_api=picture_description_api,
             )
 
             await self.store.update(

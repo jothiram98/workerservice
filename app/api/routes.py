@@ -6,7 +6,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile, status
 from fastapi.responses import FileResponse
 
-from app.models.job_models import JobResultResponse, JobStatusResponse, ProcessResponse
+from app.models.job_models import ConversionOptions, JobResultResponse, JobStatusResponse, ProcessResponse
 from app.services.job_service import JobService
 from app.services.job_store import JobStore
 
@@ -28,11 +28,28 @@ def get_job_service() -> JobService:
 
 @router.post("/process-document", response_model=ProcessResponse, status_code=status.HTTP_202_ACCEPTED)
 async def process_document(
+    # File upload
     file: UploadFile = File(...),
+    # Metadata
     tenant_id: str | None = Form(default=None),
     to_formats: str = Form(default="md"),
-    convert_include_images: bool = Form(default=True),
-    convert_do_ocr: bool = Form(default=False),
+    # Tier 1: Essential Parameters
+    table_mode: str = Form(default="accurate"),
+    do_ocr: bool = Form(default=False),
+    ocr_engine: str = Form(default="easyocr"),
+    image_export_mode: str = Form(default="embedded"),
+    # Tier 2: Important Parameters
+    images_scale: float = Form(default=2.0),
+    include_images: bool = Form(default=True),
+    do_picture_description: bool = Form(default=False),
+    picture_description_prompt: str | None = Form(default=None),
+    # Tier 3: Advanced Parameters
+    page_range_start: int | None = Form(default=None),
+    page_range_end: int | None = Form(default=None),
+    pdf_backend: str = Form(default="docling_parse"),
+    document_timeout: float | None = Form(default=None),
+    abort_on_error: bool = Form(default=False),
+    # Dependencies
     store: JobStore = Depends(get_job_store),
     service: JobService = Depends(get_job_service),
 ):
@@ -48,14 +65,33 @@ async def process_document(
             detail=f"File exceeds max size limit ({settings.max_file_size_bytes} bytes).",
         )
 
+    # Create ConversionOptions from form parameters
+    try:
+        conversion_options = ConversionOptions(
+            table_mode=table_mode,
+            do_ocr=do_ocr,
+            ocr_engine=ocr_engine,
+            image_export_mode=image_export_mode,
+            images_scale=images_scale,
+            include_images=include_images,
+            do_picture_description=do_picture_description,
+            picture_description_prompt=picture_description_prompt,
+            page_range_start=page_range_start,
+            page_range_end=page_range_end,
+            pdf_backend=pdf_backend,
+            document_timeout=document_timeout,
+            abort_on_error=abort_on_error,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=f"Invalid conversion options: {str(e)}")
+
     job = await service.create_job(filename=file.filename or "input.bin", file_bytes=data)
     asyncio.create_task(
         service.run_job(
             job_id=job.job_id,
             tenant_id=tenant_id,
             to_formats=to_formats,
-            convert_include_images=convert_include_images,
-            convert_do_ocr=convert_do_ocr,
+            conversion_options=conversion_options,
         )
     )
 
@@ -103,6 +139,7 @@ async def get_job_result(job_id: str, store: JobStore = Depends(get_job_store)):
         image_paths=job.image_paths,
         durations=job.durations,
         message=job.message,
+        conversion_options=job.conversion_options,
     )
 
 

@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     output_root: str = "./outputs"
     serve_artifacts: bool = True
     max_file_size_bytes: int = Field(default=50 * 1024 * 1024)
+    
+    # Azure OpenAI Settings
+    azure_openai_api_key: str = ""
+    azure_openai_resource: str = ""
+    azure_openai_deployment: str = ""
+    azure_openai_api_version: str = "2024-02-15-preview"
 
 
 settings = Settings()
